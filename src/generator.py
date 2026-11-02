@@ -56,7 +56,9 @@ def stream_answer(
     final: dict,
 ) -> Iterator[str]:
     """Gera o texto da resposta em streaming. Ao terminar, `final["message"]` recebe a
-    mensagem completa (stop_reason, usage). Exceções da API sobem para quem chamou."""
+    mensagem completa (stop_reason, usage). Exceções da API sobem para quem chamou.
+    Se o modelo recusar no meio da resposta e o fallback assumir, emite um separador
+    entre o texto parcial e a resposta do modelo de fallback."""
     with client.beta.messages.stream(
         model=config.LLM_MODEL,
         max_tokens=config.LLM_MAX_TOKENS,
@@ -67,8 +69,20 @@ def stream_answer(
         betas=["server-side-fallback-2026-07-01"],
         fallbacks="default",
     ) as stream:
-        yield from stream.text_stream
+        for event in stream:
+            if event.type == "content_block_start" and event.content_block.type == "fallback":
+                yield FALLBACK_SEPARATOR.format(model=event.content_block.to.model)
+            elif event.type == "content_block_delta" and event.delta.type == "text_delta":
+                yield event.delta.text
         final["message"] = stream.get_final_message()
+
+
+FALLBACK_SEPARATOR = "\n\n---\n*O modelo principal recusou; resposta do modelo de fallback `{model}`:*\n\n"
+
+
+def used_fallback(message) -> bool:
+    """Sinal oficial de que um modelo de fallback respondeu: entrada `fallback_message` em usage.iterations."""
+    return any(getattr(i, "type", None) == "fallback_message" for i in (message.usage.iterations or []))
 
 
 def describe_api_error(exc: Exception) -> str:
@@ -87,6 +101,16 @@ def describe_api_error(exc: Exception) -> str:
         return "A API da Anthropic demorou demais para responder. Tente novamente."
     if isinstance(exc, anthropic.APIConnectionError):
         return "Sem conexão com a API da Anthropic. Verifique a internet."
+    if isinstance(exc, (anthropic.OverloadedError, anthropic.InternalServerError)):
+        return UNSTABLE_MESSAGE
     if isinstance(exc, anthropic.APIStatusError):
-        return f"Erro da API da Anthropic ({exc.status_code}): {exc.message}"
+        # Erro enviado no meio do stream chega com status 200 e o tipo no corpo
+        body = exc.body if isinstance(exc.body, dict) else {}
+        error = body.get("error") if isinstance(body.get("error"), dict) else {}
+        if error.get("type") in {"overloaded_error", "api_error"}:
+            return UNSTABLE_MESSAGE
+        return f"Erro da API da Anthropic ({exc.status_code}): {error.get('message') or exc.message}"
     return f"Falha ao gerar a resposta: {exc}"
+
+
+UNSTABLE_MESSAGE = "A API da Anthropic está sobrecarregada ou instável no momento. Tente novamente em instantes."

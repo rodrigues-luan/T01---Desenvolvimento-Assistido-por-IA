@@ -261,6 +261,11 @@ with tab_embed:
         st.code(np.array2string(vec[:10], precision=5, separator=", "))
         st.bar_chart(vec, height=200)
 
+def md_safe(text: str) -> str:
+    """Escapa `$` para o Streamlit não tratar "R$ ... R$" como fórmula LaTeX."""
+    return text.replace("$", r"\$")
+
+
 def show_retrieved(results):
     """Os K chunks retornados: posição, similaridade, origem e conteúdo."""
     for rank, (doc, score) in enumerate(results, start=1):
@@ -288,7 +293,7 @@ with tab_busca:
             st.session_state.busca_hist = []
 
         hist = st.session_state.setdefault("busca_hist", [])
-        query = st.chat_input("Digite sua pergunta...", key="busca_input")
+        query = (st.chat_input("Digite sua pergunta...", key="busca_input") or "").strip()
         if query:
             try:
                 hist.append({"query": query, "k": k, "results": retriever.search(store, query, k)})
@@ -297,7 +302,7 @@ with tab_busca:
 
         for item in reversed(hist):
             with st.chat_message("user"):
-                st.write(item["query"])
+                st.markdown(md_safe(item["query"]))
             with st.chat_message("assistant"):
                 st.write(f"Top {item['k']} chunks mais similares:")
                 show_retrieved(item["results"])
@@ -310,7 +315,7 @@ def show_answer_status(message):
         st.warning("O modelo recusou responder a esta pergunta.")
     elif message.stop_reason == "max_tokens":
         st.warning(f"Resposta cortada pelo limite de {config.LLM_MAX_TOKENS} tokens (LLM_MAX_TOKENS no .env).")
-    if message.model != config.LLM_MODEL:
+    if generator.used_fallback(message):
         st.caption(f"Respondido pelo modelo de fallback `{message.model}`.")
     st.caption(
         f"`{message.model}` · tokens de entrada {message.usage.input_tokens} · "
@@ -340,20 +345,23 @@ with tab_chat:
         chat_hist = st.session_state.setdefault("chat_hist", [])
         for item in chat_hist:
             with st.chat_message("user"):
-                st.write(item["query"])
+                st.markdown(md_safe(item["query"]))
             with st.chat_message("assistant"):
-                with st.expander(f"Top {len(item['results'])} chunks recuperados", expanded=False):
-                    show_retrieved(item["results"])
+                if item["results"]:
+                    with st.expander(f"Top {len(item['results'])} chunks recuperados", expanded=False):
+                        show_retrieved(item["results"])
+                if item["answer"]:
+                    st.markdown(md_safe(item["answer"]))
                 if item["error"]:
                     st.error(item["error"])
                 else:
-                    st.markdown(item["answer"])
                     show_answer_status(item["message"])
 
-        question = st.chat_input("Pergunte sobre contratos, preços, fornecedores...", key="chat_input")
+        # strip(): pergunta só com espaços não gera busca nem chamada ao Claude
+        question = (st.chat_input("Pergunte sobre contratos, preços, fornecedores...", key="chat_input") or "").strip()
         if question:
             with st.chat_message("user"):
-                st.write(question)
+                st.markdown(md_safe(question))
             with st.chat_message("assistant"):
                 item = {"query": question, "results": [], "answer": "", "message": None, "error": None}
                 try:
@@ -366,12 +374,17 @@ with tab_chat:
                     show_retrieved(item["results"])
                     st.divider()
                     final = {}
+
+                    def _render(chunks):
+                        # Guarda o texto cru (mesmo parcial, se a API falhar no meio) e exibe escapado
+                        for piece in chunks:
+                            item["answer"] += piece
+                            yield md_safe(piece)
+
                     try:
                         client = generator.get_client()
                         with st.spinner(f"Gerando resposta com `{config.LLM_MODEL}`..."):
-                            item["answer"] = st.write_stream(
-                                generator.stream_answer(client, question, item["results"], final)
-                            )
+                            st.write_stream(_render(generator.stream_answer(client, question, item["results"], final)))
                         item["message"] = final.get("message")
                         show_answer_status(item["message"])
                     except Exception as exc:
